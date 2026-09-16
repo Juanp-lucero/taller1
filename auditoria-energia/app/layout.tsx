@@ -1,11 +1,10 @@
-
 import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "EnergyAudit | Auditoría de pérdidas",
+  title: "GridAudit | Auditoría energética",
   description:
-    "Sistema web para la auditoría de pérdidas de energía eléctrica",
+    "Plataforma local para el análisis de pérdidas de energía mediante procesamiento paralelo.",
 };
 
 export default function RootLayout({

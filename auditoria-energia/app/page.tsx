@@ -1,452 +1,727 @@
-
 "use client";
 
-import { useState } from "react";
+import React, {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-type FileStatus = {
+type FileKind = "readings" | "topology";
+
+type SelectedFile = {
+  file: File | null;
   name: string;
-  size: string;
-  loaded: boolean;
+  size: number;
+  type: FileKind;
 };
 
-export default function Home() {
-  const [readingsFile, setReadingsFile] = useState<FileStatus | null>(null);
-  const [topologyFile, setTopologyFile] = useState<FileStatus | null>(null);
+type ProcessingStats = {
+  totalBytes: number;
+  processedBytes: number;
+  processedLines: number;
+  validRecords: number;
+  emptyKwh: number;
+  invalidRecords: number;
+  uniqueMeters: number;
+  elapsedMs: number;
+};
+
+type WorkerResult = {
+  workerId: number;
+  start: number;
+  end: number;
+  processedLines: number;
+  validRecords: number;
+  emptyKwh: number;
+  invalidRecords: number;
+  meters: string[];
+};
+
+const BLOCK_SIZE = 1024 * 1024 * 4;
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.floor(Math.log(bytes) / Math.log(1024));
+
+  return `${(bytes / Math.pow(1024, index)).toFixed(2)} ${units[index]}`;
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat("es-CO").format(value);
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1000) {
+    return `${milliseconds} ms`;
+  }
+
+  return `${(milliseconds / 1000).toFixed(2)} s`;
+}
+
+export default function HomePage() {
+  const [readingsFile, setReadingsFile] = useState<SelectedFile>({
+    file: null,
+    name: "Ningún archivo seleccionado",
+    size: 0,
+    type: "readings",
+  });
+
+  const [topologyFile, setTopologyFile] = useState<SelectedFile>({
+    file: null,
+    name: "Ningún archivo seleccionado",
+    size: 0,
+    type: "topology",
+  });
+
   const [isProcessing, setIsProcessing] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [message, setMessage] = useState(
+  const [statusMessage, setStatusMessage] = useState(
     "Esperando archivos para iniciar la auditoría"
   );
 
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) {
-      return `${bytes} B`;
+  const [progress, setProgress] = useState(0);
+  const [activeWorkers, setActiveWorkers] = useState(0);
+  const [totalWorkers, setTotalWorkers] = useState(0);
+
+  const [stats, setStats] = useState<ProcessingStats>({
+    totalBytes: 0,
+    processedBytes: 0,
+    processedLines: 0,
+    validRecords: 0,
+    emptyKwh: 0,
+    invalidRecords: 0,
+    uniqueMeters: 0,
+    elapsedMs: 0,
+  });
+
+  const [hasResults, setHasResults] = useState(false);
+
+  const workersRef = useRef<Worker[]>([]);
+  const metersRef = useRef<Set<string>>(new Set());
+  const startTimeRef = useRef<number>(0);
+
+  const hardwareWorkers = useMemo(() => {
+    if (typeof navigator === "undefined") {
+      return 2;
     }
 
-    if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(2)} KB`;
+    const cores = navigator.hardwareConcurrency || 4;
+
+    return Math.max(2, Math.min(cores - 1, 8));
+  }, []);
+
+  useEffect(() => {
+    setTotalWorkers(hardwareWorkers);
+  }, [hardwareWorkers]);
+
+  function handleFileChange(
+    event: React.ChangeEvent<HTMLInputElement>,
+    type: FileKind
+  ) {
+    const selectedFile = event.target.files?.[0];
+
+    if (!selectedFile) {
+      return;
     }
 
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  };
+    const fileData: SelectedFile = {
+      file: selectedFile,
+      name: selectedFile.name,
+      size: selectedFile.size,
+      type,
+    };
 
-  const handleReadingsUpload = (
-    event: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const file = event.target.files?.[0];
+    if (type === "readings") {
+      setReadingsFile(fileData);
+    } else {
+      setTopologyFile(fileData);
+    }
 
-    if (!file) return;
+    setHasResults(false);
+    setStatusMessage(`Archivo ${selectedFile.name} seleccionado`);
+  }
 
-    setReadingsFile({
-      name: file.name,
-      size: formatFileSize(file.size),
-      loaded: true,
+  function clearWorkers() {
+    workersRef.current.forEach((worker) => {
+      worker.terminate();
     });
 
-    setMessage("Archivo de lecturas cargado correctamente");
-  };
+    workersRef.current = [];
+  }
 
-  const handleTopologyUpload = (
-    event: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    const file = event.target.files?.[0];
-
-    if (!file) return;
-
-    setTopologyFile({
-      name: file.name,
-      size: formatFileSize(file.size),
-      loaded: true,
+  function resetStats() {
+    setStats({
+      totalBytes: 0,
+      processedBytes: 0,
+      processedLines: 0,
+      validRecords: 0,
+      emptyKwh: 0,
+      invalidRecords: 0,
+      uniqueMeters: 0,
+      elapsedMs: 0,
     });
 
-    setMessage("Archivo de topología cargado correctamente");
-  };
+    setProgress(0);
+    setActiveWorkers(0);
+    metersRef.current = new Set();
+  }
 
-  const startAudit = () => {
-    if (!readingsFile || !topologyFile) {
-      setMessage("Debes cargar los dos archivos CSV antes de continuar");
+  async function processFile(
+    file: File,
+    fileType: FileKind,
+    workerCount: number
+  ): Promise<{
+    processedLines: number;
+    validRecords: number;
+    emptyKwh: number;
+    invalidRecords: number;
+    uniqueMeters: number;
+    elapsedMs: number;
+  }> {
+    return new Promise((resolve, reject) => {
+      const totalBytes = file.size;
+      const totalBlocks = Math.ceil(totalBytes / BLOCK_SIZE);
+
+      let nextBlock = 0;
+      let completedBlocks = 0;
+      let processedLines = 0;
+      let validRecords = 0;
+      let emptyKwh = 0;
+      let invalidRecords = 0;
+
+      const localMeters = new Set<string>();
+      const workers: Worker[] = [];
+
+      const startedAt = performance.now();
+
+      function assignNextBlock(worker: Worker, workerId: number) {
+        if (nextBlock >= totalBlocks) {
+          worker.terminate();
+
+          const remainingWorkers = workers.filter(
+            (currentWorker) => currentWorker !== worker
+          );
+
+          workers.length = 0;
+          workers.push(...remainingWorkers);
+
+          setActiveWorkers(workers.length);
+
+          if (completedBlocks === totalBlocks) {
+            const elapsedMs = Math.round(performance.now() - startedAt);
+
+            resolve({
+              processedLines,
+              validRecords,
+              emptyKwh,
+              invalidRecords,
+              uniqueMeters: localMeters.size,
+              elapsedMs,
+            });
+          }
+
+          return;
+        }
+
+        const blockIndex = nextBlock;
+        nextBlock++;
+
+        const start = blockIndex * BLOCK_SIZE;
+        const end = Math.min(start + BLOCK_SIZE, totalBytes);
+
+        worker.postMessage({
+          file,
+          start,
+          end,
+          workerId,
+          fileType,
+        });
+      }
+
+      for (let index = 0; index < workerCount; index++) {
+        const worker = new Worker("/workers/csv-worker.js");
+
+        workers.push(worker);
+
+        worker.onmessage = (event: MessageEvent) => {
+          const result = event.data;
+
+          if (result.type === "error") {
+            clearWorkers();
+            reject(new Error(result.message));
+            return;
+          }
+
+          if (result.type !== "completed") {
+            return;
+          }
+
+          processedLines += result.processedLines;
+          validRecords += result.validRecords;
+          emptyKwh += result.emptyKwh;
+          invalidRecords += result.invalidRecords;
+
+          result.meters.forEach((meterId: string) => {
+            localMeters.add(meterId);
+          });
+
+          completedBlocks++;
+
+          const processedBytes = Math.min(
+            completedBlocks * BLOCK_SIZE,
+            totalBytes
+          );
+
+          const currentProgress = Math.round(
+            (processedBytes / totalBytes) * 100
+          );
+
+          setProgress(currentProgress);
+
+          setStats((previous) => ({
+            ...previous,
+            processedBytes,
+            processedLines,
+            validRecords,
+            emptyKwh,
+            invalidRecords,
+            uniqueMeters: localMeters.size,
+          }));
+
+          assignNextBlock(worker, result.workerId);
+        };
+
+        worker.onerror = () => {
+          clearWorkers();
+          reject(new Error("Uno de los Workers falló durante el procesamiento"));
+        };
+
+        assignNextBlock(worker, index);
+      }
+
+      setActiveWorkers(workers.length);
+    });
+  }
+
+  async function startAudit() {
+    if (!readingsFile.file) {
+      setStatusMessage("Selecciona primero el archivo lecturas_mes.csv");
       return;
     }
 
     setIsProcessing(true);
-    setProgress(0);
-    setMessage("Preparando archivos para el procesamiento...");
+    setHasResults(false);
+    resetStats();
+    clearWorkers();
 
-    let currentProgress = 0;
+    startTimeRef.current = performance.now();
 
-    const interval = setInterval(() => {
-      currentProgress += 10;
-      setProgress(currentProgress);
+    try {
+      const readings = readingsFile.file;
 
-      if (currentProgress >= 100) {
-        clearInterval(interval);
-        setIsProcessing(false);
-        setMessage(
-          "Archivos validados. El motor de análisis estará disponible en la siguiente fase."
+      setStatusMessage("Procesando lecturas con Worker Pool...");
+
+      const readingsResult = await processFile(
+        readings,
+        "readings",
+        hardwareWorkers
+      );
+
+      let topologyResult = {
+        processedLines: 0,
+        validRecords: 0,
+        emptyKwh: 0,
+        invalidRecords: 0,
+        uniqueMeters: 0,
+        elapsedMs: 0,
+      };
+
+      if (topologyFile.file) {
+        setStatusMessage("Procesando archivo de topología...");
+
+        topologyResult = await processFile(
+          topologyFile.file,
+          "topology",
+          hardwareWorkers
         );
       }
-    }, 250);
-  };
+
+      const elapsedMs = Math.round(performance.now() - startTimeRef.current);
+
+      setStats({
+        totalBytes: readings.size + (topologyFile.file?.size || 0),
+        processedBytes: readings.size + (topologyFile.file?.size || 0),
+        processedLines:
+          readingsResult.processedLines + topologyResult.processedLines,
+        validRecords:
+          readingsResult.validRecords + topologyResult.validRecords,
+        emptyKwh: readingsResult.emptyKwh,
+        invalidRecords:
+          readingsResult.invalidRecords + topologyResult.invalidRecords,
+        uniqueMeters: readingsResult.uniqueMeters,
+        elapsedMs,
+      });
+
+      setProgress(100);
+      setHasResults(true);
+      setStatusMessage(
+        "Procesamiento terminado. Los resultados corresponden al análisis básico de archivos."
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Error desconocido durante la auditoría";
+
+      setStatusMessage(message);
+    } finally {
+      clearWorkers();
+      setActiveWorkers(0);
+      setIsProcessing(false);
+    }
+  }
+
+  const readingsReady = Boolean(readingsFile.file);
+  const topologyReady = Boolean(topologyFile.file);
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-950/95">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-500 text-xl font-bold text-slate-950">
-              ⚡
-            </div>
+    <main className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-icon">⚡</div>
 
-            <div>
-              <h1 className="text-xl font-bold">
-                EnergyAudit
-              </h1>
-
-              <p className="text-sm text-slate-400">
-                Plataforma de auditoría energética
-              </p>
-            </div>
-          </div>
-
-          <div className="hidden items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-sm text-emerald-400 sm:flex">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            Procesamiento local
+          <div>
+            <h1>GridAudit</h1>
+            <span>Energy Intelligence</span>
           </div>
         </div>
-      </header>
 
-      <div className="mx-auto max-w-7xl px-6 py-8">
-        {/* Introduction */}
-        <section className="mb-8">
-          <p className="mb-2 text-sm font-medium uppercase tracking-wider text-emerald-400">
-            Centro de control
-          </p>
+        <nav className="sidebar-nav">
+          <a className="nav-item active" href="#dashboard">
+            <span>▦</span>
+            Dashboard
+          </a>
 
-          <h2 className="text-3xl font-bold tracking-tight sm:text-4xl">
-            Auditoría de pérdidas de energía
-          </h2>
+          <a className="nav-item" href="#files">
+            <span>▤</span>
+            Archivos
+          </a>
 
-          <p className="mt-3 max-w-3xl text-slate-400">
-            Analiza las lecturas de los medidores y la topología eléctrica
-            para identificar pérdidas no explicadas y preparar el plan de
-            inspección semanal.
-          </p>
-        </section>
+          <a className="nav-item" href="#processing">
+            <span>◌</span>
+            Procesamiento
+          </a>
 
-        {/* Statistics */}
-        <section className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-            <p className="text-sm text-slate-400">Clientes registrados</p>
-            <p className="mt-2 text-3xl font-bold">260.000</p>
-            <p className="mt-2 text-xs text-slate-500">
-              Capacidad del sistema
+          <a className="nav-item" href="#results">
+            <span>▥</span>
+            Resultados
+          </a>
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="system-status">
+            <span className="status-dot" />
+            Sistema local activo
+          </div>
+
+          <small>Auditoría energética v1.0</small>
+        </div>
+      </aside>
+
+      <section className="main-content">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">PLATAFORMA DE AUDITORÍA</p>
+            <h2>Auditoría de pérdidas de energía</h2>
+            <p className="subtitle">
+              Procesamiento local de lecturas y topología mediante
+              procesamiento paralelo.
             </p>
           </div>
 
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-            <p className="text-sm text-slate-400">Lecturas del mes</p>
-            <p className="mt-2 text-3xl font-bold">20 M</p>
-            <p className="mt-2 text-xs text-slate-500">
-              Aproximadamente
-            </p>
+          <div className="header-badge">
+            <span className="status-dot" />
+            Offline ready
           </div>
+        </header>
 
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-            <p className="text-sm text-slate-400">Horas analizadas</p>
-            <p className="mt-2 text-3xl font-bold">720</p>
-            <p className="mt-2 text-xs text-slate-500">
-              Mes de referencia
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-            <p className="text-sm text-slate-400">Transformadores</p>
-            <p className="mt-2 text-3xl font-bold">—</p>
-            <p className="mt-2 text-xs text-slate-500">
-              Pendiente de análisis
-            </p>
-          </div>
-        </section>
-
-        {/* Main content */}
-        <section className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          {/* Upload panel */}
-          <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6 lg:col-span-2">
-            <div className="mb-6">
-              <h3 className="text-xl font-semibold">
-                Cargar archivos de auditoría
-              </h3>
-
-              <p className="mt-2 text-sm text-slate-400">
-                Selecciona los archivos desde tu computador. Los datos se
-                procesarán localmente en el navegador.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              {/* Readings file */}
-              <label className="cursor-pointer rounded-xl border border-dashed border-slate-700 bg-slate-950 p-5 transition hover:border-emerald-500">
-                <div className="mb-4 flex items-center justify-between">
-                  <span className="text-3xl">📄</span>
-
-                  {readingsFile && (
-                    <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
-                      Cargado
-                    </span>
-                  )}
-                </div>
-
-                <h4 className="font-semibold">Lecturas del mes</h4>
-
-                <p className="mt-2 text-sm text-slate-400">
-                  lecturas_mes.csv
-                </p>
-
-                <p className="mt-3 text-xs text-slate-500">
-                  Archivo con las lecturas horarias de los medidores.
-                </p>
-
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  className="mt-5 block w-full text-sm text-slate-400 file:mr-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:px-3 file:py-2 file:font-medium file:text-slate-950 hover:file:bg-emerald-400"
-                  onChange={handleReadingsUpload}
-                />
-
-                {readingsFile && (
-                  <div className="mt-4 rounded-lg bg-slate-900 p-3">
-                    <p className="break-all text-sm text-emerald-400">
-                      {readingsFile.name}
-                    </p>
-
-                    <p className="mt-1 text-xs text-slate-500">
-                      {readingsFile.size}
-                    </p>
-                  </div>
-                )}
-              </label>
-
-              {/* Topology file */}
-              <label className="cursor-pointer rounded-xl border border-dashed border-slate-700 bg-slate-950 p-5 transition hover:border-emerald-500">
-                <div className="mb-4 flex items-center justify-between">
-                  <span className="text-3xl">🗺️</span>
-
-                  {topologyFile && (
-                    <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
-                      Cargado
-                    </span>
-                  )}
-                </div>
-
-                <h4 className="font-semibold">Topología eléctrica</h4>
-
-                <p className="mt-2 text-sm text-slate-400">
-                  topologia.csv
-                </p>
-
-                <p className="mt-3 text-xs text-slate-500">
-                  Archivo con las relaciones jerárquicas de la red.
-                </p>
-
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  className="mt-5 block w-full text-sm text-slate-400 file:mr-3 file:rounded-lg file:border-0 file:bg-emerald-500 file:px-3 file:py-2 file:font-medium file:text-slate-950 hover:file:bg-emerald-400"
-                  onChange={handleTopologyUpload}
-                />
-
-                {topologyFile && (
-                  <div className="mt-4 rounded-lg bg-slate-900 p-3">
-                    <p className="break-all text-sm text-emerald-400">
-                      {topologyFile.name}
-                    </p>
-
-                    <p className="mt-1 text-xs text-slate-500">
-                      {topologyFile.size}
-                    </p>
-                  </div>
-                )}
-              </label>
-            </div>
-
-            {/* Start button */}
-            <div className="mt-6">
-              <button
-                onClick={startAudit}
-                disabled={
-                  isProcessing || !readingsFile || !topologyFile
-                }
-                className="w-full rounded-xl bg-emerald-500 px-5 py-3 font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-500"
-              >
-                {isProcessing
-                  ? "Validando archivos..."
-                  : "Iniciar auditoría"}
-              </button>
-            </div>
-
-            {/* Progress */}
-            <div className="mt-6">
-              <div className="mb-2 flex justify-between text-sm">
-                <span className="text-slate-400">Estado del proceso</span>
-                <span className="font-medium text-emerald-400">
-                  {progress}%
-                </span>
-              </div>
-
-              <div className="h-3 overflow-hidden rounded-full bg-slate-800">
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-all duration-300"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-
-              <p className="mt-3 text-sm text-slate-400">
-                {message}
-              </p>
-            </div>
-          </div>
-
-          {/* System status */}
-          <aside className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
-            <h3 className="text-xl font-semibold">
-              Estado del sistema
-            </h3>
-
-            <p className="mt-2 text-sm text-slate-400">
-              Componentes de la plataforma
-            </p>
-
-            <div className="mt-6 space-y-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300">
-                  Aplicación Next.js
-                </span>
-
-                <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs text-emerald-400">
-                  Activo
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300">
-                  Procesamiento local
-                </span>
-
-                <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs text-emerald-400">
-                  Preparado
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300">
-                  Web Workers
-                </span>
-
-                <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs text-amber-400">
-                  Pendiente
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300">
-                  Índice de medidores
-                </span>
-
-                <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs text-amber-400">
-                  Pendiente
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300">
-                  Motor estadístico
-                </span>
-
-                <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs text-amber-400">
-                  Pendiente
-                </span>
-              </div>
-            </div>
-
-            <div className="mt-8 rounded-xl border border-slate-700 bg-slate-950 p-4">
-              <p className="text-sm font-medium text-slate-300">
-                Seguridad de los datos
-              </p>
-
-              <p className="mt-2 text-sm leading-6 text-slate-400">
-                Los archivos seleccionados no se envían a un servidor
-                mediante este formulario. La lectura y el análisis real
-                se implementarán en el navegador.
-              </p>
-            </div>
-          </aside>
-        </section>
-
-        {/* Ranking preview */}
-        <section className="mt-8 rounded-2xl border border-slate-800 bg-slate-900 p-6">
-          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+        <section id="dashboard" className="section-block">
+          <div className="section-heading">
             <div>
-              <h3 className="text-xl font-semibold">
-                Ranking de transformadores
-              </h3>
-
-              <p className="mt-2 text-sm text-slate-400">
-                Los 200 transformadores con mayor pérdida acumulada no
-                explicada.
-              </p>
+              <p className="eyebrow">RESUMEN OPERATIVO</p>
+              <h3>Estado de la auditoría</h3>
             </div>
 
-            <span className="rounded-full border border-slate-700 px-3 py-2 text-xs text-slate-400">
-              Sin resultados todavía
+            <span className="tag">Fase 1 · Worker Pool</span>
+          </div>
+
+          <div className="metrics-grid">
+            <article className="metric-card">
+              <div className="metric-icon blue">◫</div>
+              <div>
+                <span>Bytes procesados</span>
+                <strong>{formatBytes(stats.processedBytes)}</strong>
+                <small>{formatBytes(stats.totalBytes)} totales</small>
+              </div>
+            </article>
+
+            <article className="metric-card">
+              <div className="metric-icon purple">⌘</div>
+              <div>
+                <span>Registros válidos</span>
+                <strong>{formatNumber(stats.validRecords)}</strong>
+                <small>Lecturas y topología</small>
+              </div>
+            </article>
+
+            <article className="metric-card">
+              <div className="metric-icon orange">◉</div>
+              <div>
+                <span>Medidores detectados</span>
+                <strong>{formatNumber(stats.uniqueMeters)}</strong>
+                <small>Identificadores únicos</small>
+              </div>
+            </article>
+
+            <article className="metric-card">
+              <div className="metric-icon green">◷</div>
+              <div>
+                <span>Tiempo de ejecución</span>
+                <strong>{formatDuration(stats.elapsedMs)}</strong>
+                <small>Medición local</small>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="files" className="section-block">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">ENTRADA DE DATOS</p>
+              <h3>Archivos de auditoría</h3>
+            </div>
+
+            <span className="tag">CSV local</span>
+          </div>
+
+          <div className="files-grid">
+            <article className="file-card">
+              <div className="file-card-header">
+                <div className="file-title">
+                  <div className="file-icon">▤</div>
+
+                  <div>
+                    <h4>Lecturas mensuales</h4>
+                    <p>lecturas_mes.csv</p>
+                  </div>
+                </div>
+
+                <span className={readingsReady ? "file-state ready" : "file-state"}>
+                  {readingsReady ? "Listo" : "Pendiente"}
+                </span>
+              </div>
+
+              <label className="upload-area">
+                <input
+                  type="file"
+                  accept=".csv"
+                  onChange={(event) =>
+                    handleFileChange(event, "readings")
+                  }
+                />
+
+                <span className="upload-symbol">↑</span>
+                <strong>Seleccionar archivo CSV</strong>
+                <small>Lecturas horarias de medidores</small>
+              </label>
+
+              <div className="file-information">
+                <span>{readingsFile.name}</span>
+                <strong>{formatBytes(readingsFile.size)}</strong>
+              </div>
+            </article>
+
+            <article className="file-card">
+              <div className="file-card-header">
+                <div className="file-title">
+                  <div className="file-icon">⌘</div>
+
+                  <div>
+                    <h4>Topología de red</h4>
+                    <p>topologia.csv</p>
+                  </div>
+                </div>
+
+                <span className={topologyReady ? "file-state ready" : "file-state"}>
+                  {topologyReady ? "Listo" : "Opcional"}
+                </span>
+              </div>
+
+              <label className="upload-area">
+                <input
+                  type="file"
+                  accept=".csv"
+                  onChange={(event) =>
+                    handleFileChange(event, "topology")
+                  }
+                />
+
+                <span className="upload-symbol">↑</span>
+                <strong>Seleccionar archivo CSV</strong>
+                <small>Jerarquía y vigencias de la red</small>
+              </label>
+
+              <div className="file-information">
+                <span>{topologyFile.name}</span>
+                <strong>{formatBytes(topologyFile.size)}</strong>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="processing" className="section-block">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">PROCESAMIENTO PARALELO</p>
+              <h3>Monitor de ejecución</h3>
+            </div>
+
+            <span className="tag">
+              {activeWorkers} / {totalWorkers} Workers activos
             </span>
           </div>
 
-          <div className="mt-6 overflow-x-auto">
-            <table className="w-full min-w-[500px] text-left text-sm">
-              <thead className="border-b border-slate-800 text-slate-400">
-                <tr>
-                  <th className="px-4 py-3">Posición</th>
-                  <th className="px-4 py-3">Transformador</th>
-                  <th className="px-4 py-3">Pérdida acumulada</th>
-                  <th className="px-4 py-3">Estado</th>
-                </tr>
-              </thead>
+          <article className="processing-card">
+            <div className="processing-header">
+              <div>
+                <h4>Worker Pool dinámico</h4>
+                <p>
+                  El archivo se divide en bloques y se distribuye entre
+                  varios Workers del navegador.
+                </p>
+              </div>
 
-              <tbody>
-                {[1, 2, 3].map((position) => (
-                  <tr
-                    key={position}
-                    className="border-b border-slate-800/70"
-                  >
-                    <td className="px-4 py-4 text-slate-500">
-                      {position}
-                    </td>
+              <div className="worker-counter">
+                <strong>{totalWorkers}</strong>
+                <span>Workers configurados</span>
+              </div>
+            </div>
 
-                    <td className="px-4 py-4 text-slate-300">
-                      —
-                    </td>
+            <div className="progress-section">
+              <div className="progress-label">
+                <span>Progreso de lectura</span>
+                <strong>{progress}%</strong>
+              </div>
 
-                    <td className="px-4 py-4 text-slate-500">
-                      —
-                    </td>
+              <div className="progress-track">
+                <div
+                  className="progress-value"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
 
-                    <td className="px-4 py-4">
-                      <span className="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-400">
-                        Pendiente
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+            <div className="processing-grid">
+              <div>
+                <span>Líneas procesadas</span>
+                <strong>{formatNumber(stats.processedLines)}</strong>
+              </div>
+
+              <div>
+                <span>Valores kWh vacíos</span>
+                <strong>{formatNumber(stats.emptyKwh)}</strong>
+              </div>
+
+              <div>
+                <span>Registros inválidos</span>
+                <strong>{formatNumber(stats.invalidRecords)}</strong>
+              </div>
+
+              <div>
+                <span>Bloques aproximados</span>
+                <strong>
+                  {readingsFile.file
+                    ? Math.ceil(readingsFile.size / BLOCK_SIZE)
+                    : 0}
+                </strong>
+              </div>
+            </div>
+
+            <div className="processing-footer">
+              <div className="live-status">
+                <span className={isProcessing ? "pulse-dot" : "status-dot"} />
+                <span>{statusMessage}</span>
+              </div>
+
+              <button
+                className="primary-button"
+                onClick={startAudit}
+                disabled={isProcessing || !readingsReady}
+              >
+                {isProcessing ? "Procesando..." : "Iniciar auditoría"}
+                <span>→</span>
+              </button>
+            </div>
+          </article>
         </section>
 
-        <footer className="mt-8 border-t border-slate-800 py-6 text-center text-sm text-slate-500">
-          EnergyAudit · Caso de estudio de Ingeniería de Software
+        <section id="results" className="section-block">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">RESULTADOS</p>
+              <h3>Hallazgos del procesamiento</h3>
+            </div>
+
+            <span className="tag">Análisis básico</span>
+          </div>
+
+          {!hasResults ? (
+            <article className="empty-results">
+              <div className="empty-icon">⌁</div>
+              <h4>Aún no hay resultados de auditoría</h4>
+              <p>
+                Carga los archivos e inicia el procesamiento para obtener
+                métricas reales.
+              </p>
+            </article>
+          ) : (
+            <div className="results-grid">
+              <article className="result-card">
+                <span>Registros procesados</span>
+                <strong>{formatNumber(stats.processedLines)}</strong>
+                <small>Conteo obtenido desde los archivos</small>
+              </article>
+
+              <article className="result-card">
+                <span>Registros inválidos</span>
+                <strong>{formatNumber(stats.invalidRecords)}</strong>
+                <small>Filas que no cumplen la estructura básica</small>
+              </article>
+
+              <article className="result-card">
+                <span>Huecos kWh detectados</span>
+                <strong>{formatNumber(stats.emptyKwh)}</strong>
+                <small>Aún no imputados</small>
+              </article>
+
+              <article className="result-card">
+                <span>Estado</span>
+                <strong>Lectura completada</strong>
+                <small>
+                  Todavía no se calculan pérdidas ni anomalías
+                </small>
+              </article>
+            </div>
+          )}
+        </section>
+
+        <footer className="footer">
+          <span>GridAudit · Auditoría energética local</span>
+          <span>Fase 1: lectura paralela con Web Workers</span>
         </footer>
-      </div>
+      </section>
     </main>
   );
 }
